@@ -424,7 +424,7 @@ class CompressSpatialDenoiseStrategy:
         print("="*60)
 
         # Extract spatial components from U matrix
-        u_dense = pmd_no_denoiser.u.to_dense()
+        u_dense = pmd_no_denoiser.u_local_projector.to_dense()
         
         # Get spatial dimensions from dataset
         if hasattr(self.dataset, 'shape'):
@@ -663,7 +663,8 @@ class CompressSpatialTemporalDenoiseStrategy:
         print("STEP 2: Training spatial denoiser")
         print("="*60)
 
-        u_dense = pmd_no_denoiser.u.to_dense()
+        u_dense = pmd_no_denoiser.u_local_projector.to_dense()
+
         if hasattr(self.dataset, 'shape'):
             H, W = self.dataset.shape[1], self.dataset.shape[2]
         else:
