@@ -428,10 +428,10 @@ class PMDSpatialDenoiser(nn.Module):
             signal_var = torch.clamp(total_var_clamped - noise_var, min=0.0)
             
             # Wiener filtering weights
-            weight_signal = noise_var / total_var_clamped
-            weight_observation = signal_var / total_var_clamped
+            #weight_signal = noise_var / total_var_clamped
+            #weight_observation = signal_var / total_var_clamped
             
-            denoised_normalized = weight_signal * mu_x + weight_observation * comp_padded
+            denoised_normalized = mu_x
         
         if self._padding > 0:
             p = self._padding
