@@ -262,13 +262,13 @@ class CompressSpatialDenoiseStrategy:
                  pixel_weighting: Optional[np.ndarray] = None,
                  device: Literal["auto", "cpu", "cuda"] = "auto",
                  # Spatial denoiser parameters
-                 spatial_denoiser_epochs: int = 5,
+                 spatial_denoiser_epochs: int = 50,
                  spatial_denoiser_batch_size: int = 32,
                  spatial_denoiser_lr: float = 1e-4,
                  noise_variance_quantile: float = 0.7,
-                 denoiser_padding: int = 12,
-                 patch_h: int = 40,
-                 patch_w: int = 40,
+                 denoiser_padding: int = 0,
+                 patch_h: int = 32,
+                 patch_w: int = 32,
                  ):
 
         self._dataset = dataset
@@ -490,6 +490,7 @@ class CompressSpatialDenoiseStrategy:
         print("="*60 + "\n")
 
         return self._results
+
 
 
 class CompressSpatialTemporalDenoiseStrategy:
