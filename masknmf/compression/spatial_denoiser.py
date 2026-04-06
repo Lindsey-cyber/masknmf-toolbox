@@ -10,19 +10,13 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from omegaconf import OmegaConf
 
-
-# =====================================================================
-# Neural Network Architecture
-# =====================================================================
-
 class MaskedConv2d(nn.Conv2d):
     """Conv2d with center pixel masked to prevent information leakage."""
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         mask = torch.ones_like(self.weight)
-        kH, kW = self.weight.shape[-2:]
-        mask[:, :, kH // 2, kW // 2] = 0.0
+        mask[:, :, 1:-1, 1:-1] = 0.0
         self.register_buffer("mask", mask)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -62,11 +56,11 @@ class BlindSpotSpatial(nn.Module):
 
         # Blind-spot convolution path
         self.bsconv1 = ConvBlock2d(1, 16, kernel_size=3, dilation=1, use_mask=True)
-        self.bsconv2 = ConvBlock2d(16, 32, kernel_size=3, dilation=2, use_mask=True)
-        self.bsconv3 = ConvBlock2d(32, 48, kernel_size=3, dilation=3, use_mask=True)
-        self.bsconv4 = ConvBlock2d(48, 64, kernel_size=3, dilation=4, use_mask=True)
-        self.bsconv5 = ConvBlock2d(64, 80, kernel_size=3, dilation=5, use_mask=True)
-        self.bsconv6 = ConvBlock2d(80, 96, kernel_size=3, dilation=6, use_mask=True)
+        self.bsconv2 = ConvBlock2d(16, 32, kernel_size=5, dilation=1, use_mask=True)
+        self.bsconv3 = ConvBlock2d(32, 48, kernel_size=7, dilation=1, use_mask=True)
+        self.bsconv4 = ConvBlock2d(48, 64, kernel_size=9, dilation=1, use_mask=True)
+        self.bsconv5 = ConvBlock2d(64, 80, kernel_size=11, dilation=1, use_mask=True)
+        self.bsconv6 = ConvBlock2d(80, 96, kernel_size=13, dilation=1, use_mask=True)
 
         self.final = nn.Conv2d(16 + 32 + 48 + 64 + 80 + 96, out_channels, kernel_size=1)
         self.final_activation = final_activation or nn.Identity()
@@ -132,6 +126,61 @@ class TotalVarianceSpatialDenoiser(pl.LightningModule):
 # Data Processing Utilities
 # =====================================================================
 
+def normalize_patch(x: torch.Tensor, eps: float = 1e-12) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize a patch and return normalized values, mean, and norm."""
+    x = x.float()
+    mean = x.mean()
+    centered = x - mean
+    norm = torch.clamp(torch.linalg.norm(centered), min=eps)
+    normalized = centered / norm
+    return normalized, mean, norm
+
+
+def pad_or_crop_to_size(
+    patch: torch.Tensor,
+    target_size: Tuple[int, int],
+    padding_mode: str = "reflect",
+) -> torch.Tensor:
+    """Center crop if larger, otherwise symmetrically pad to target size."""
+    target_h, target_w = target_size
+    h, w = patch.shape
+
+    if h >= target_h and w >= target_w:
+        start_h = (h - target_h) // 2
+        start_w = (w - target_w) // 2
+        return patch[start_h:start_h + target_h, start_w:start_w + target_w]
+
+    pad_h = max(0, target_h - h)
+    pad_w = max(0, target_w - w)
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    patch_4d = patch.unsqueeze(0).unsqueeze(0)
+    padded = F.pad(
+        patch_4d,
+        (pad_left, pad_right, pad_top, pad_bottom),
+        mode=padding_mode
+    )
+    return padded.squeeze(0).squeeze(0)
+
+
+def pad_2d_for_model(x: torch.Tensor, padding: int, mode: str = "reflect") -> torch.Tensor:
+    """Convert (H, W) input to padded (1, 1, H, W) tensor for the model."""
+    x4 = x.unsqueeze(0).unsqueeze(0)
+    if padding <= 0:
+        return x4
+    return F.pad(x4, (padding, padding, padding, padding), mode=mode)
+
+
+def unpad_4d(x: torch.Tensor, padding: int) -> torch.Tensor:
+    """Remove symmetric spatial padding from a 4D tensor."""
+    if padding <= 0:
+        return x
+    return x[:, :, padding:-padding, padding:-padding]
+
 def detect_nonzero_bbox(img: np.ndarray, 
                        threshold_quantile: float = 0.01, 
                        min_size: int = 32) -> Tuple[int, int, int, int]:
@@ -195,7 +244,7 @@ def detect_nonzero_bbox(img: np.ndarray,
 
 
 def extract_component_patches(spatial_components: torch.Tensor, 
-                              padding: int = 2,
+                              padding: int = 0,
                               threshold_quantile: float = 0.01,
                               min_size: int = 32) -> Tuple[List[torch.Tensor], List[Dict]]:
     """
@@ -263,7 +312,7 @@ class SpatialComponentPatchDataset(Dataset):
     def __init__(self, 
                  patches: List[torch.Tensor],
                  metadata: List[Dict],
-                 target_size: Tuple[int, int] = (128, 128),
+                 target_size: Tuple[int, int] = (32,32),
                  padding_mode: str = 'reflect'):
         """
         Args:
@@ -277,20 +326,6 @@ class SpatialComponentPatchDataset(Dataset):
         self.target_h, self.target_w = target_size
         self.padding_mode = padding_mode
         
-        # Compute normalization parameters
-        self.means = []
-        self.norms = []
-        
-        for patch in self.patches:
-            mean = patch.mean()
-            centered = patch - mean
-            norm = torch.linalg.norm(centered)
-            if norm < 1e-6:
-                norm = torch.tensor(1.0)
-            
-            self.means.append(mean)
-            self.norms.append(norm)
-        
         print(f"Dataset created: {len(self.patches)} patches")
         total_memory = sum(p.element_size() * p.nelement() for p in self.patches)
         print(f"Memory footprint: {total_memory / 1024**3:.2f} GB")
@@ -300,39 +335,15 @@ class SpatialComponentPatchDataset(Dataset):
     
     def _pad_to_target_size(self, patch: torch.Tensor) -> torch.Tensor:
         """Pad or crop patch to target size."""
-        h, w = patch.shape
-        
-        if h >= self.target_h and w >= self.target_w:
-            # Center crop if larger
-            start_h = (h - self.target_h) // 2
-            start_w = (w - self.target_w) // 2
-            return patch[start_h:start_h+self.target_h, start_w:start_w+self.target_w]
-        
-        # Compute padding
-        pad_h = max(0, self.target_h - h)
-        pad_w = max(0, self.target_w - w)
-        
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-        
-        patch_4d = patch.unsqueeze(0).unsqueeze(0)
-        padded = F.pad(
-            patch_4d,
-            (pad_left, pad_right, pad_top, pad_bottom),
-            mode=self.padding_mode
+        return pad_or_crop_to_size(
+            patch,
+            target_size=(self.target_h, self.target_w),
+            padding_mode=self.padding_mode,
         )
-        
-        return padded.squeeze(0).squeeze(0)
     
     def __getitem__(self, idx: int) -> torch.Tensor:
         patch = self.patches[idx]
-        mean = self.means[idx]
-        norm = self.norms[idx]
-        
-        # Normalize
-        normalized = (patch - mean) / norm
+        normalized, _, _ = normalize_patch(patch)
         
         # Pad to target size
         padded = self._pad_to_target_size(normalized)
@@ -340,105 +351,42 @@ class SpatialComponentPatchDataset(Dataset):
         # Add channel dimension
         return padded.unsqueeze(0)
 
-
-# =====================================================================
-# PMD Integration Wrapper
-# =====================================================================
-
 class PMDSpatialDenoiser(nn.Module):
     """Wrapper that adapts the trained spatial denoiser for PMD usage."""
     
     def __init__(self,
                  trained_model: TotalVarianceSpatialDenoiser,
                  noise_variance_quantile: float = 0.05,
-                 padding: int = 12):
+                 padding: int = 0):
         """
         Args:
             trained_model: Trained TotalVarianceSpatialDenoiser
-            noise_variance_quantile: Quantile for noise variance estimation
+            noise_variance_quantile: Legacy argument kept for compatibility
             padding: Padding for spatial components during denoising
         """
         super().__init__()
         self.net = trained_model.spatial_network
         self.noise_variance_quantile = noise_variance_quantile
         self._padding = padding
-    
-    def _estimate_noise_variance(self, spatial_basis: torch.Tensor) -> torch.Tensor:
-        """Estimate noise variance for each spatial component."""
-        H, W, num_comp = spatial_basis.shape
-        device = spatial_basis.device
-        noise_vars = torch.zeros(num_comp, device=device)
-        
+
+    def _forward_component(self, component: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the network on a single normalized component."""
+        comp_normalized, comp_mean, comp_norm = normalize_patch(component)
+        comp_input = pad_2d_for_model(comp_normalized, padding=self._padding, mode="reflect")
+
         with torch.no_grad():
-            for idx in range(num_comp):
-                comp = spatial_basis[:, :, idx]
-                comp_mean = comp.mean()
-                comp_centered = comp - comp_mean
-                comp_norm = torch.clamp(torch.linalg.norm(comp_centered), min=1e-6)
-                comp_normalized = comp_centered / comp_norm
-                
-                if self._padding > 0:
-                    comp_input = F.pad(
-                        comp_normalized.unsqueeze(0).unsqueeze(0),
-                        (self._padding,) * 4,
-                        mode='reflect'
-                    )
-                else:
-                    comp_input = comp_normalized.unsqueeze(0).unsqueeze(0)
-                
-                _, total_var = self.net(comp_input)
-                
-                if self._padding > 0:
-                    p = self._padding
-                    total_var_center = total_var[:, :, p:-p, p:-p]
-                else:
-                    total_var_center = total_var
-                
-                noise_vars[idx] = torch.quantile(
-                    total_var_center.flatten(),
-                    self.noise_variance_quantile
-                )
-        
-        return noise_vars
+            mu_x, _ = self.net(comp_input)
+
+        mu_x = unpad_4d(mu_x, self._padding)
+        return mu_x, comp_mean, comp_norm
     
     def _denoise_single_component(self,
                                   component: torch.Tensor,
-                                  component_idx: int,
-                                  noise_variance: torch.Tensor) -> torch.Tensor:
-        """Denoise a single spatial component using Wiener filtering."""
-        comp_mean = component.mean()
-        comp_centered = component - comp_mean
-        comp_norm = torch.clamp(torch.linalg.norm(comp_centered), min=1e-6)
-        comp_normalized = comp_centered / comp_norm
-        
-        if self._padding > 0:
-            comp_padded = F.pad(
-                comp_normalized.unsqueeze(0).unsqueeze(0),
-                (self._padding,) * 4,
-                mode='reflect'
-            )
-        else:
-            comp_padded = comp_normalized.unsqueeze(0).unsqueeze(0)
-        
-        with torch.no_grad():
-            mu_x, total_var = self.net(comp_padded)
-            
-            noise_var = noise_variance[component_idx].view(1, 1, 1, 1)
-            total_var_clamped = torch.clamp(total_var, min=noise_var)
-            signal_var = torch.clamp(total_var_clamped - noise_var, min=0.0)
-            
-            # Wiener filtering weights
-            weight_signal = noise_var / total_var_clamped
-            weight_observation = signal_var / total_var_clamped
-            
-            denoised_normalized = weight_signal * mu_x + weight_observation * comp_padded
-        
-        if self._padding > 0:
-            p = self._padding
-            denoised_normalized = denoised_normalized[:, :, p:-p, p:-p]
-        
-        # Denormalize
-        denoised = denoised_normalized.squeeze(0).squeeze(0) * comp_norm + comp_mean
+                                  component_idx: Optional[int] = None,
+                                  noise_variance: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Denoise a single spatial component using the predicted blind-spot mean."""
+        mu_x, comp_mean, comp_norm = self._forward_component(component)
+        denoised = mu_x.squeeze(0).squeeze(0) * comp_norm + comp_mean
         return denoised
     
     def forward(self, spatial_basis: torch.Tensor) -> torch.Tensor:
@@ -451,21 +399,15 @@ class PMDSpatialDenoiser(nn.Module):
         Returns:
             Denoised spatial basis of same shape
         """
-        H, W, num_comp = spatial_basis.shape
-        noise_variance = self._estimate_noise_variance(spatial_basis)
+        _, _, num_comp = spatial_basis.shape
         
         denoised_components = []
         for i in range(num_comp):
             comp = spatial_basis[:, :, i]
-            denoised_comp = self._denoise_single_component(comp, i, noise_variance)
+            denoised_comp = self._denoise_single_component(comp)
             denoised_components.append(denoised_comp)
         
         return torch.stack(denoised_components, dim=2)
-
-
-# =====================================================================
-# Main Training Function
-# =====================================================================
 
 def train_spatial_denoiser(
     spatial_components: torch.Tensor,
@@ -487,17 +429,17 @@ def train_spatial_denoiser(
     
     # Default configuration
     default_config = {
-        'patch_h': 40,
-        'patch_w': 40,
-        'crop_padding': 2,
+        'patch_h': 32,
+        'patch_w': 32,
+        'crop_padding': 0,
         'crop_threshold_quantile': 0.01,
         'min_patch_size': 32,
         'train_patch_subset': 500000,
         'batch_size': 32,
         'num_workers': 0,
         'learning_rate': 1e-4,
-        'max_epochs': 5,
-        'gradient_accumulation_steps': 2,
+        'max_epochs': 50,
+        'gradient_accumulation_steps': 1,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
     
@@ -622,14 +564,14 @@ def train_spatial_denoiser(
 
 def create_pmd_denoiser(trained_model: TotalVarianceSpatialDenoiser,
                        noise_variance_quantile: float = 0.7,
-                       padding: int = 12,
+                       padding: int = 0,
                        device: str = 'cuda') -> PMDSpatialDenoiser:
     """
     Create a PMD-compatible spatial denoiser from a trained model.
     
     Args:
         trained_model: Trained TotalVarianceSpatialDenoiser
-        noise_variance_quantile: Quantile for noise estimation (0.0-1.0)
+        noise_variance_quantile: Legacy argument kept for compatibility
         padding: Padding to use during inference
         device: Device to place the model on
     
@@ -645,7 +587,6 @@ def create_pmd_denoiser(trained_model: TotalVarianceSpatialDenoiser,
     pmd_denoiser.eval()
     
     print(f"\n✓ PMD spatial denoiser created")
-    print(f"  Noise variance quantile: {noise_variance_quantile}")
     print(f"  Padding: {padding}")
     print(f"  Device: {device}")
     
