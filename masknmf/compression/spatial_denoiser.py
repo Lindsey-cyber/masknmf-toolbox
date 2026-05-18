@@ -5,607 +5,437 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
-from omegaconf import OmegaConf
 
-class MaskedConv2d(nn.Conv2d):
-    """Conv2d with center pixel masked to prevent information leakage."""
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        mask = torch.ones_like(self.weight)
-        mask[:, :, 1:-1, 1:-1] = 0.0
-        self.register_buffer("mask", mask)
+class DirectionalShift(nn.Module):
+    """Shift a feature map by `shift` pixels along a given direction.
+
+    Paired with subsequent same-padding 3x3 conv layers, this guarantees
+    the receptive field of every output position strictly excludes its
+    own input pixel (blind-spot property).
+    """
+
+    def __init__(self, direction: str, shift: int):
+        super().__init__()
+        assert direction in ('up', 'down', 'left', 'right')
+        assert shift >= 2
+        self.direction = direction
+        self.shift = shift
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(
-            x, self.weight * self.mask, self.bias,
-            self.stride, self.padding, self.dilation, self.groups
+        # x: (B, C, H, W); F.pad order is (left, right, top, bottom)
+        s = self.shift
+        if self.direction == 'up':
+            return F.pad(x, (0, 0, s, 0))[:, :, :-s, :]
+        elif self.direction == 'down':
+            return F.pad(x, (0, 0, 0, s))[:, :, s:, :]
+        elif self.direction == 'left':
+            return F.pad(x, (s, 0, 0, 0))[:, :, :, :-s]
+        elif self.direction == 'right':
+            return F.pad(x, (0, s, 0, 0))[:, :, :, s:]
+
+
+class DirectionalBranch(nn.Module):
+    """Shift + n stacked 3x3 conv layers; receptive field is a strict half-plane."""
+
+    def __init__(self, in_ch: int, hidden_ch: int, direction: str, n_layers: int = 3):
+        super().__init__()
+        # shift >= n_layers + 1 ensures the RF strictly excludes the center row/col
+        self.shift = DirectionalShift(direction, shift=n_layers + 1)
+        layers = []
+        c_in = in_ch
+        for _ in range(n_layers):
+            layers.append(nn.Conv2d(c_in, hidden_ch, kernel_size=3, padding=1))
+            layers.append(nn.ReLU(inplace=True))
+            c_in = hidden_ch
+        self.convs = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.convs(self.shift(x))
+
+
+class BlindSpotCNN(nn.Module):
+    """4-branch blind-spot 2D CNN spatial denoiser.
+
+    Four directional branches (up/down/left/right) run in parallel; their
+    features are concatenated and fused by 1x1 convs into a scalar prediction.
+    With hidden_ch=32 and n_conv_per_branch=3 on a 32x32 block the per-branch
+    RF is ~7 pixels and the total parameter count is ~100k.
+    """
+
+    def __init__(self, hidden_ch: int = 32, n_conv_per_branch: int = 3):
+        super().__init__()
+        self.up    = DirectionalBranch(1, hidden_ch, 'up',    n_conv_per_branch)
+        self.down  = DirectionalBranch(1, hidden_ch, 'down',  n_conv_per_branch)
+        self.left  = DirectionalBranch(1, hidden_ch, 'left',  n_conv_per_branch)
+        self.right = DirectionalBranch(1, hidden_ch, 'right', n_conv_per_branch)
+
+        fused_ch = 4 * hidden_ch
+        self.fuse = nn.Sequential(
+            nn.Conv2d(fused_ch, hidden_ch, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_ch, hidden_ch, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_ch, 1, kernel_size=1),
         )
 
-
-class ConvBlock2d(nn.Module):
-    """Convolution block with LeakyReLU activation."""
-    
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 dilation: int = 1, use_mask: bool = False):
-        super().__init__()
-        padding = dilation * (kernel_size // 2)
-        ConvClass = MaskedConv2d if use_mask else nn.Conv2d
-        self.conv = ConvClass(in_ch, out_ch, kernel_size,
-                              dilation=dilation, padding=padding)
-        self.act = nn.LeakyReLU(0.1)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.conv(x))
+        # x: (B, 1, H, W)
+        fu = self.up(x)
+        fd = self.down(x)
+        fl = self.left(x)
+        fr = self.right(x)
+        f = torch.cat([fu, fd, fl, fr], dim=1)
+        return self.fuse(f)
+
+class SpatialDenoiserWrapper:
+    """Wrap a trained BlindSpotCNN as a callable spatial denoiser for masknmf.
+
+    masknmf's spatial_denoiser slot expects an input of shape (H, W, N).
+    Internally, this wrapper:
+      - converts to (N, 1, H, W) for the CNN
+      - per-component standardizes input to match training distribution
+      - aligns the sign of the top-k denoised components to the originals
+      - hard-gates: only the top-k strongest components are kept; the rest
+        are zeroed out
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        device: str = 'cuda',
+        standardize: bool = True,
+        keep_k: int = 3,
+    ):
+        self.model = model.to(device).eval()
+        self.device = device
+        self.standardize = standardize
+        self.keep_k = keep_k
+
+    def to(self, device: str) -> 'SpatialDenoiserWrapper':
+        self.device = device
+        self.model = self.model.to(device).eval()
+        return self
+
+    @torch.no_grad()
+    def __call__(self, spatial_basis: torch.Tensor) -> torch.Tensor:
+        # spatial_basis: (H, W, N)
+        H, W, N = spatial_basis.shape
+        if N == 0:
+            return spatial_basis
+
+        x = spatial_basis.permute(2, 0, 1).unsqueeze(1).to(self.device)  # (N, 1, H, W)
+
+        if self.standardize:
+            std = x.std(dim=(1, 2, 3), keepdim=True).clamp(min=1e-8)
+            x_in = x / std
+        else:
+            x_in = x
+            std = 1.0
+
+        y = self.model(x_in)
+
+        if self.standardize:
+            y = y * std
+
+        keep_k = min(self.keep_k, N)
+
+        # Sign-align the top keep_k components to the original input
+        y_aligned = y.clone()
+        for i in range(keep_k):
+            ref = x[i:i + 1]
+            den = y[i:i + 1]
+            corr = torch.sum(ref * den)
+            sign = torch.sign(corr)
+            if sign == 0:
+                sign = torch.tensor(1.0, device=den.device, dtype=den.dtype)
+            y_aligned[i:i + 1] = den * sign
+
+        # Hard gate: keep only the first keep_k
+        out_x = torch.zeros_like(x)
+        out_x[:keep_k] = y_aligned[:keep_k]
+
+        out = out_x.squeeze(1).permute(1, 2, 0).to(
+            dtype=spatial_basis.dtype, device=spatial_basis.device
+        )
+        return out
 
 
-class BlindSpotSpatial(nn.Module):
-    """Blind-spot network backbone that never sees the center pixel."""
-    
-    def __init__(self, out_channels: int = 1, final_activation: Optional[nn.Module] = None):
-        super().__init__()
-        # Regular convolution path
-        self.reg_conv1 = ConvBlock2d(1, 16, kernel_size=3, dilation=1, use_mask=False)
-        self.reg_conv2 = ConvBlock2d(16, 32, kernel_size=3, dilation=1, use_mask=False)
-        self.reg_conv3 = ConvBlock2d(32, 48, kernel_size=3, dilation=1, use_mask=False)
-        self.reg_conv4 = ConvBlock2d(48, 64, kernel_size=3, dilation=1, use_mask=False)
-        self.reg_conv5 = ConvBlock2d(64, 80, kernel_size=3, dilation=1, use_mask=False)
-
-        # Blind-spot convolution path
-        self.bsconv1 = ConvBlock2d(1, 16, kernel_size=3, dilation=1, use_mask=True)
-        self.bsconv2 = ConvBlock2d(16, 32, kernel_size=5, dilation=1, use_mask=True)
-        self.bsconv3 = ConvBlock2d(32, 48, kernel_size=7, dilation=1, use_mask=True)
-        self.bsconv4 = ConvBlock2d(48, 64, kernel_size=9, dilation=1, use_mask=True)
-        self.bsconv5 = ConvBlock2d(64, 80, kernel_size=11, dilation=1, use_mask=True)
-        self.bsconv6 = ConvBlock2d(80, 96, kernel_size=13, dilation=1, use_mask=True)
-
-        self.final = nn.Conv2d(16 + 32 + 48 + 64 + 80 + 96, out_channels, kernel_size=1)
-        self.final_activation = final_activation or nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Regular path
-        enc1 = self.reg_conv1(x)
-        enc2 = self.reg_conv2(enc1)
-        enc3 = self.reg_conv3(enc2)
-        enc4 = self.reg_conv4(enc3)
-        enc5 = self.reg_conv5(enc4)
-
-        # Blind-spot path
-        bs1 = self.bsconv1(x)
-        bs2 = self.bsconv2(enc1)
-        bs3 = self.bsconv3(enc2)
-        bs4 = self.bsconv4(enc3)
-        bs5 = self.bsconv5(enc4)
-        bs6 = self.bsconv6(enc5)
-
-        out = torch.cat([bs1, bs2, bs3, bs4, bs5, bs6], dim=1)
-        return self.final_activation(self.final(out))
+def _augment(batch: torch.Tensor) -> torch.Tensor:
+    """Random flips / 90 deg rotations / sign flip. batch: (B, 1, H, W)."""
+    if torch.rand(1).item() < 0.5:
+        batch = torch.flip(batch, dims=[2])
+    if torch.rand(1).item() < 0.5:
+        batch = torch.flip(batch, dims=[3])
+    k = int(torch.randint(0, 4, (1,)).item())
+    if k > 0:
+        batch = torch.rot90(batch, k=k, dims=[2, 3])
+    if torch.rand(1).item() < 0.5:
+        batch = -batch
+    return batch
 
 
-class SpatialNetwork(nn.Module):
-    """Predicts mean and total variance for denoising."""
-    
-    def __init__(self):
-        super().__init__()
-        self.mean_backbone = BlindSpotSpatial(out_channels=1, final_activation=None)
-        self.var_backbone = BlindSpotSpatial(out_channels=1, final_activation=nn.Softplus())
+def collect_spatial_bases_from_blocks(block_basis_list: List[torch.Tensor]) -> torch.Tensor:
+    """Concatenate per-block spatial bases into a single (N_total, H, W) tensor.
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.mean_backbone(x), self.var_backbone(x)
+    Args:
+        block_basis_list: list of (H, W, n_k) tensors, one per PMD block.
 
-
-class TotalVarianceSpatialDenoiser(pl.LightningModule):
-    """PyTorch Lightning module for training the spatial denoiser."""
-    
-    def __init__(self, learning_rate: float = 1e-3, max_epochs: int = 5):
-        super().__init__()
-        self.spatial_network = SpatialNetwork()
-        self.learning_rate = learning_rate
-        self.max_epochs = max_epochs
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.spatial_network(x)
-
-    def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
-        mu_x, total_variance = self(batch)
-        total_variance = torch.clamp(total_variance, min=1e-8)
-        log_lik = torch.nansum(torch.log(total_variance))
-        log_lik += torch.nansum((batch - mu_x) ** 2 / total_variance)
-        loss = log_lik / batch.numel()
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+    Returns:
+        Tensor of shape (N_total, H, W).
+    """
+    if len(block_basis_list) == 0:
+        raise ValueError("No blocks provided.")
+    H, W = block_basis_list[0].shape[:2]
+    for b in block_basis_list:
+        if b.shape[:2] != (H, W):
+            raise ValueError(
+                f"Inconsistent block size: got {b.shape[:2]}, expected {(H, W)}"
+            )
+    all_basis = torch.cat([b.detach().cpu() for b in block_basis_list], dim=2)  # (H, W, N_total)
+    return all_basis.permute(2, 0, 1).contiguous()
 
 
-# =====================================================================
-# Data Processing Utilities
-# =====================================================================
-
-def normalize_patch(x: torch.Tensor, eps: float = 1e-12) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Normalize a patch and return normalized values, mean, and norm."""
-    x = x.float()
-    mean = x.mean()
-    centered = x - mean
-    norm = torch.clamp(torch.linalg.norm(centered), min=eps)
-    normalized = centered / norm
-    return normalized, mean, norm
-
-
-def pad_or_crop_to_size(
-    patch: torch.Tensor,
-    target_size: Tuple[int, int],
-    padding_mode: str = "reflect",
+def extract_component_patches(
+    pmd_result,
+    d1: int,
+    d2: int,
+    block_h: int = 32,
+    block_w: int = 32,
 ) -> torch.Tensor:
-    """Center crop if larger, otherwise symmetrically pad to target size."""
-    target_h, target_w = target_size
-    h, w = patch.shape
+    """Crop a (block_h, block_w) patch centered on each PMD component's centroid.
 
-    if h >= target_h and w >= target_w:
-        start_h = (h - target_h) // 2
-        start_w = (w - target_w) // 2
-        return patch[start_h:start_h + target_h, start_w:start_w + target_w]
-
-    pad_h = max(0, target_h - h)
-    pad_w = max(0, target_w - w)
-
-    pad_top = pad_h // 2
-    pad_bottom = pad_h - pad_top
-    pad_left = pad_w // 2
-    pad_right = pad_w - pad_left
-
-    patch_4d = patch.unsqueeze(0).unsqueeze(0)
-    padded = F.pad(
-        patch_4d,
-        (pad_left, pad_right, pad_top, pad_bottom),
-        mode=padding_mode
-    )
-    return padded.squeeze(0).squeeze(0)
-
-
-def pad_2d_for_model(x: torch.Tensor, padding: int, mode: str = "reflect") -> torch.Tensor:
-    """Convert (H, W) input to padded (1, 1, H, W) tensor for the model."""
-    x4 = x.unsqueeze(0).unsqueeze(0)
-    if padding <= 0:
-        return x4
-    return F.pad(x4, (padding, padding, padding, padding), mode=mode)
-
-
-def unpad_4d(x: torch.Tensor, padding: int) -> torch.Tensor:
-    """Remove symmetric spatial padding from a 4D tensor."""
-    if padding <= 0:
-        return x
-    return x[:, :, padding:-padding, padding:-padding]
-
-def detect_nonzero_bbox(img: np.ndarray, 
-                       threshold_quantile: float = 0.01, 
-                       min_size: int = 32) -> Tuple[int, int, int, int]:
-    """
-    Detect bounding box of non-zero regions in an image.
-    
     Args:
-        img: Input image (H, W)
-        threshold_quantile: Quantile threshold to determine "non-zero" regions
-        min_size: Minimum bounding box size
-    
+        pmd_result: PMDArray-like object exposing a spatial basis attribute
+            (`u`, `u_sparse`, or `spatial_basis`).
+        d1, d2: full FOV spatial dimensions.
+        block_h, block_w: patch size.
+
     Returns:
-        Tuple of (row_min, row_max, col_min, col_max)
+        Tensor of shape (N, block_h, block_w).
     """
-    if isinstance(img, torch.Tensor):
-        img = img.detach().cpu().numpy()
-    
-    img_abs = np.abs(img)
-    
-    # Use quantile threshold to filter noise
-    if np.any(img_abs > 0):
-        threshold = np.quantile(img_abs[img_abs > 0], threshold_quantile)
+    u = None
+    for attr in ("u", "u_sparse", "spatial_basis"):
+        if hasattr(pmd_result, attr):
+            u = getattr(pmd_result, attr)
+            break
+    if u is None:
+        raise AttributeError(
+            "Could not find spatial basis on PMD result "
+            "(expected attribute `u`, `u_sparse`, or `spatial_basis`)."
+        )
+
+    if hasattr(u, "to_dense"):
+        u_dense = u.to_dense()
     else:
-        return 0, img.shape[0], 0, img.shape[1]
-    
-    mask = img_abs > threshold
-    
-    if not np.any(mask):
-        return 0, img.shape[0], 0, img.shape[1]
-    
-    # Find boundary rows and columns
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    
-    row_indices = np.where(rows)[0]
-    col_indices = np.where(cols)[0]
-    
-    if len(row_indices) == 0 or len(col_indices) == 0:
-        return 0, img.shape[0], 0, img.shape[1]
-    
-    row_min, row_max = row_indices[0], row_indices[-1] + 1
-    col_min, col_max = col_indices[0], col_indices[-1] + 1
-    
-    # Ensure minimum size
-    row_span = row_max - row_min
-    col_span = col_max - col_min
-    
-    if row_span < min_size:
-        center = (row_min + row_max) // 2
-        row_min = max(0, center - min_size // 2)
-        row_max = min(img.shape[0], row_min + min_size)
-        row_min = max(0, row_max - min_size)
-    
-    if col_span < min_size:
-        center = (col_min + col_max) // 2
-        col_min = max(0, center - min_size // 2)
-        col_max = min(img.shape[1], col_min + min_size)
-        col_min = max(0, col_max - min_size)
-    
-    return row_min, row_max, col_min, col_max
+        u_dense = u
+    if isinstance(u_dense, torch.Tensor):
+        u_dense = u_dense.detach().cpu().numpy()
+    u_dense = np.asarray(u_dense, dtype=np.float32)  # (P, N)
+    N = u_dense.shape[1]
+    U = u_dense.reshape(d1, d2, N)
 
+    patches = np.zeros((N, block_h, block_w), dtype=np.float32)
+    i_idx = np.arange(d1, dtype=np.float32)
+    j_idx = np.arange(d2, dtype=np.float32)
+    for k in range(N):
+        comp = np.abs(U[:, :, k])
+        w = comp.sum()
+        if w < 1e-8:
+            ci, cj = d1 // 2, d2 // 2
+        else:
+            ci = int((comp.sum(axis=1) * i_idx).sum() / w)
+            cj = int((comp.sum(axis=0) * j_idx).sum() / w)
+        i0 = int(max(0, min(ci - block_h // 2, d1 - block_h)))
+        j0 = int(max(0, min(cj - block_w // 2, d2 - block_w)))
+        patches[k] = U[i0:i0 + block_h, j0:j0 + block_w, k]
+    return torch.from_numpy(patches)
 
-def extract_component_patches(spatial_components: torch.Tensor, 
-                              padding: int = 0,
-                              threshold_quantile: float = 0.01,
-                              min_size: int = 32) -> Tuple[List[torch.Tensor], List[Dict]]:
-    """
-    Extract valid patch regions from spatial components.
-    
+def train_blindspot_denoiser(
+    basis_tensor: torch.Tensor,
+    epochs: int = 100,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    hidden_ch: int = 32,
+    n_conv_per_branch: int = 3,
+    device: str = 'cuda',
+    val_fraction: float = 0.1,
+    augment: bool = True,
+    verbose: bool = True,
+) -> Tuple[nn.Module, List[float], List[float]]:
+    """Train a BlindSpotCNN.
+
     Args:
-        spatial_components: Shape (num_components, H, W)
-        padding: Padding around detected bounding box
-        threshold_quantile: Quantile threshold for detection
-        min_size: Minimum patch size
-    
+        basis_tensor: (N_total, H, W) stack of spatial basis vectors.
+
     Returns:
-        patches: List of extracted patches
-        metadata: List of metadata dicts for each patch
+        (best_model, train_losses, val_losses)
     """
-    num_comp, H, W = spatial_components.shape
-    patches = []
-    metadata = []
-    
-    print(f"\n{'='*60}")
-    print("Extracting valid patches from spatial components...")
-    print(f"{'='*60}")
-    
-    for idx in range(num_comp):
-        comp = spatial_components[idx]
-        
-        # Detect bounding box
-        row_min, row_max, col_min, col_max = detect_nonzero_bbox(
-            comp, threshold_quantile=threshold_quantile, min_size=min_size
-        )
-        
-        # Add padding
-        row_min = max(0, row_min - padding)
-        row_max = min(H, row_max + padding)
-        col_min = max(0, col_min - padding)
-        col_max = min(W, col_max + padding)
-        
-        # Crop patch
-        patch = comp[row_min:row_max, col_min:col_max]
-        
-        # Filter out invalid patches
-        if patch.numel() < min_size * min_size or torch.std(patch) < 1e-6:
-            continue
-        
-        patches.append(patch)
-        metadata.append({
-            'component_idx': idx,
-            'bbox': (row_min, row_max, col_min, col_max),
-            'original_shape': (H, W),
-            'patch_shape': patch.shape
-        })
-        
-        if (idx + 1) % 500 == 0:
-            print(f"  Processed {idx + 1}/{num_comp} components...")
-    
-    print(f"\nExtracted {len(patches)} valid patches from {num_comp} components")
-    print(f"{'='*60}\n")
-    
-    return patches, metadata
+    assert basis_tensor.ndim == 3, f"Expected (N, H, W), got {basis_tensor.shape}"
+    N_total, H, W = basis_tensor.shape
 
+    train_losses: List[float] = []
+    val_losses: List[float] = []
 
-class SpatialComponentPatchDataset(Dataset):
-    """Dataset for training on extracted spatial component patches."""
-    
-    def __init__(self, 
-                 patches: List[torch.Tensor],
-                 metadata: List[Dict],
-                 target_size: Tuple[int, int] = (32,32),
-                 padding_mode: str = 'reflect'):
-        """
-        Args:
-            patches: List of cropped patches with varying sizes
-            metadata: Metadata for each patch
-            target_size: Target size for uniform batching (H, W)
-            padding_mode: Padding mode ('reflect', 'constant', 'replicate')
-        """
-        self.patches = [p.float().cpu() for p in patches]
-        self.metadata = metadata
-        self.target_h, self.target_w = target_size
-        self.padding_mode = padding_mode
-        
-        print(f"Dataset created: {len(self.patches)} patches")
-        total_memory = sum(p.element_size() * p.nelement() for p in self.patches)
-        print(f"Memory footprint: {total_memory / 1024**3:.2f} GB")
-    
-    def __len__(self) -> int:
-        return len(self.patches)
-    
-    def _pad_to_target_size(self, patch: torch.Tensor) -> torch.Tensor:
-        """Pad or crop patch to target size."""
-        return pad_or_crop_to_size(
-            patch,
-            target_size=(self.target_h, self.target_w),
-            padding_mode=self.padding_mode,
-        )
-    
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        patch = self.patches[idx]
-        normalized, _, _ = normalize_patch(patch)
-        
-        # Pad to target size
-        padded = self._pad_to_target_size(normalized)
-        
-        # Add channel dimension
-        return padded.unsqueeze(0)
+    # Per-component standardization so the network sees unit-variance input
+    stds = basis_tensor.reshape(N_total, -1).std(dim=1).clamp(min=1e-8)
+    data = basis_tensor / stds.view(N_total, 1, 1)
+    data = data.unsqueeze(1)  # (N_total, 1, H, W)
 
-class PMDSpatialDenoiser(nn.Module):
-    """Wrapper that adapts the trained spatial denoiser for PMD usage."""
-    
-    def __init__(self,
-                 trained_model: TotalVarianceSpatialDenoiser,
-                 noise_variance_quantile: float = 0.05,
-                 padding: int = 0):
-        """
-        Args:
-            trained_model: Trained TotalVarianceSpatialDenoiser
-            noise_variance_quantile: Legacy argument kept for compatibility
-            padding: Padding for spatial components during denoising
-        """
-        super().__init__()
-        self.net = trained_model.spatial_network
-        self.noise_variance_quantile = noise_variance_quantile
-        self._padding = padding
+    perm = torch.randperm(N_total)
+    n_val = max(1, int(N_total * val_fraction))
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    train_data = data[train_idx].to(device)
+    val_data = data[val_idx].to(device)
 
-    def _forward_component(self, component: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the network on a single normalized component."""
-        comp_normalized, comp_mean, comp_norm = normalize_patch(component)
-        comp_input = pad_2d_for_model(comp_normalized, padding=self._padding, mode="reflect")
+    model = BlindSpotCNN(hidden_ch=hidden_ch, n_conv_per_branch=n_conv_per_branch).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
+    best_val = float('inf')
+    best_state = None
+    n_train = train_data.shape[0]
+
+    for epoch in range(epochs):
+        model.train()
+        perm_e = torch.randperm(n_train)
+        total_loss = 0.0
+        n_batches = 0
+        for i in range(0, n_train, batch_size):
+            idx = perm_e[i:i + batch_size]
+            batch = train_data[idx]
+            if augment:
+                batch = _augment(batch)
+            pred = model(batch)
+            # Blind-spot property => MSE is safe over all positions, no mask needed
+            loss = F.mse_loss(pred, batch)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+            n_batches += 1
+
+        model.eval()
         with torch.no_grad():
-            mu_x, _ = self.net(comp_input)
+            val_pred = model(val_data)
+            val_loss = F.mse_loss(val_pred, val_data).item()
 
-        mu_x = unpad_4d(mu_x, self._padding)
-        return mu_x, comp_mean, comp_norm
-    
-    def _denoise_single_component(self,
-                                  component: torch.Tensor,
-                                  component_idx: Optional[int] = None,
-                                  noise_variance: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Denoise a single spatial component using the predicted blind-spot mean."""
-        mu_x, comp_mean, comp_norm = self._forward_component(component)
-        denoised = mu_x.squeeze(0).squeeze(0) * comp_norm + comp_mean
-        return denoised
-    
-    def forward(self, spatial_basis: torch.Tensor) -> torch.Tensor:
-        """
-        Denoise all spatial components.
-        
-        Args:
-            spatial_basis: Tensor of shape (H, W, num_comp)
-        
-        Returns:
-            Denoised spatial basis of same shape
-        """
-        _, _, num_comp = spatial_basis.shape
-        
-        denoised_components = []
-        for i in range(num_comp):
-            comp = spatial_basis[:, :, i]
-            denoised_comp = self._denoise_single_component(comp)
-            denoised_components.append(denoised_comp)
-        
-        return torch.stack(denoised_components, dim=2)
+        avg_train_loss = total_loss / n_batches
+        train_losses.append(avg_train_loss)
+        val_losses.append(val_loss)
 
-def train_spatial_denoiser(
-    spatial_components: torch.Tensor,
-    config: Optional[Dict] = None,
-    output_dir: Optional[str] = None
-) -> Tuple[TotalVarianceSpatialDenoiser, Dict]:
-    """
-    Train a spatial denoiser on PMD spatial components.
-    
-    Args:
-        spatial_components: Tensor of shape (num_components, H, W)
-        config: Configuration dictionary with training parameters
-        output_dir: Directory to save model and logs
-    
-    Returns:
-        trained_model: Trained denoiser model
-        training_info: Dictionary with training statistics
-    """
-    
-    # Default configuration
-    default_config = {
-        'patch_h': 32,
-        'patch_w': 32,
-        'crop_padding': 0,
-        'crop_threshold_quantile': 0.01,
-        'min_patch_size': 32,
-        'train_patch_subset': 500000,
-        'batch_size': 32,
-        'num_workers': 0,
-        'learning_rate': 1e-4,
-        'max_epochs': 50,
-        'gradient_accumulation_steps': 1,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
-    }
-    
-    cfg = {**default_config, **(config or {})}
-    device = cfg['device']
-    
-    print(f"\n{'='*60}")
-    print("Starting Spatial Denoiser Training")
-    print(f"{'='*60}")
-    print(f"Device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"Total memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-    
-    # Extract patches from spatial components
-    patches, metadata = extract_component_patches(
-        spatial_components,
-        padding=cfg['crop_padding'],
-        threshold_quantile=cfg['crop_threshold_quantile'],
-        min_size=cfg['min_patch_size']
-    )
-    
-    # Print patch statistics
-    patch_sizes = [p.shape for p in patches]
-    print(f"\n📊 Patch Statistics:")
-    print(f"  Number of patches: {len(patches)}")
-    print(f"  Size range: {min(min(s) for s in patch_sizes)} - {max(max(s) for s in patch_sizes)} pixels")
-    print(f"  Average size: {np.mean([p.numel() for p in patches]):.0f} pixels")
-    
-    # Create dataset
-    dataset = SpatialComponentPatchDataset(
-        patches=patches,
-        metadata=metadata,
-        target_size=(cfg['patch_h'], cfg['patch_w']),
-        padding_mode='reflect'
-    )
-    
-    # Use subset if specified
-    if cfg['train_patch_subset'] is not None:
-        subset_n = min(int(cfg['train_patch_subset']), len(dataset))
-        indices = torch.randperm(len(dataset))[:subset_n].tolist()
-        dataset = torch.utils.data.Subset(dataset, indices)
-        print(f"Using {subset_n} random patches for training")
-    
-    # Create DataLoader
-    train_loader = DataLoader(
-        dataset,
-        batch_size=cfg['batch_size'],
-        shuffle=True,
-        num_workers=cfg['num_workers'],
-        pin_memory=True,
-        persistent_workers=cfg['num_workers'] > 0,
-    )
-    print(f"DataLoader ready with {len(train_loader)} batches")
-    
-    # Clear GPU cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Initialize model
-    model = TotalVarianceSpatialDenoiser(
-        learning_rate=cfg['learning_rate'],
-        max_epochs=cfg['max_epochs']
-    )
-    
-    # Setup trainer
-    logger = TensorBoardLogger("lightning_logs", name="spatial_denoiser")
-    trainer = pl.Trainer(
-        max_epochs=cfg['max_epochs'],
-        log_every_n_steps=10,
-        devices=1,
-        accelerator="gpu" if device == "cuda" else "cpu",
-        precision="16-mixed" if device == "cuda" else 32,
-        logger=logger,
-        gradient_clip_val=1.0,
-        accumulate_grad_batches=cfg['gradient_accumulation_steps'],
-        enable_checkpointing=True,
-        enable_progress_bar=True,
-    )
-    
-    print(f"\nStarting training...")
-    print(f"Effective batch size: {cfg['batch_size'] * cfg['gradient_accumulation_steps']}")
-    
-    # Train
-    trainer.fit(model, train_loader)
-    print("Training complete!")
-    
-    # Report peak memory
-    if torch.cuda.is_available():
-        print(f"Peak GPU memory: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
-        torch.cuda.reset_peak_memory_stats()
-    
-    # Save model
-    if output_dir:
-        out_path = Path(output_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-        model_path = out_path / "spatial_denoiser_state_dict.pth"
-        torch.save(model.state_dict(), model_path)
-        print(f"Model saved to: {model_path}")
-    
-    # Test blind-spot property
-    model.to(device)
-    leak_diff = test_blindspot_leakage(model.spatial_network, device=device)
-    print(f"\nBlindspot leakage test: {leak_diff:.2e}")
-    if leak_diff > 1e-6:
-        print("⚠️  WARNING: Potential information leakage detected!")
-    else:
-        print("✓ Blindspot property verified")
-    
-    # Compile training info
-    training_info = {
-        'num_patches': len(patches),
-        'num_components': spatial_components.shape[0],
-        'patch_size_range': (min(min(s) for s in patch_sizes), max(max(s) for s in patch_sizes)),
-        'training_patches': len(dataset),
-        'blindspot_leakage': leak_diff,
-        'config': cfg
-    }
-    
-    return model, training_info
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
+        if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
+            print(f"[epoch {epoch:3d}] train {avg_train_loss:.5f} "
+                  f"val {val_loss:.5f} (best {best_val:.5f})")
 
-def create_pmd_denoiser(trained_model: TotalVarianceSpatialDenoiser,
-                       noise_variance_quantile: float = 0.7,
-                       padding: int = 0,
-                       device: str = 'cuda') -> PMDSpatialDenoiser:
-    """
-    Create a PMD-compatible spatial denoiser from a trained model.
-    
-    Args:
-        trained_model: Trained TotalVarianceSpatialDenoiser
-        noise_variance_quantile: Legacy argument kept for compatibility
-        padding: Padding to use during inference
-        device: Device to place the model on
-    
-    Returns:
-        PMD-compatible denoiser ready for use
-    """
-    pmd_denoiser = PMDSpatialDenoiser(
-        trained_model=trained_model,
-        noise_variance_quantile=noise_variance_quantile,
-        padding=padding
-    )
-    pmd_denoiser.to(device)
-    pmd_denoiser.eval()
-    
-    print(f"\n✓ PMD spatial denoiser created")
-    print(f"  Padding: {padding}")
-    print(f"  Device: {device}")
-    
-    return pmd_denoiser
-
-
-def test_blindspot_leakage(model: nn.Module, H: int = 64, W: int = 64, 
-                          device: str = 'cuda') -> float:
-    """Test if the blind-spot property holds."""
+    model.load_state_dict(best_state)
     model.eval()
+    return model, train_losses, val_losses
+
+def build_trained_spatial_denoiser(
+    block_basis_list: List[torch.Tensor],
+    device: str = 'cuda',
+    epochs: int = 100,
+    batch_size: int = 64,
+    verbose: bool = True,
+) -> SpatialDenoiserWrapper:
+    """Collect block bases -> train BlindSpotCNN -> verify -> wrap for masknmf.
+
+    The returned wrapper can be passed directly as `spatial_denoiser` to
+    `pmd_decomposition` for a subsequent round.
+    """
+    if verbose:
+        print(f"Collecting {len(block_basis_list)} blocks of spatial bases...")
+    basis_tensor = collect_spatial_bases_from_blocks(block_basis_list)
+    N, H, W = basis_tensor.shape
+    if verbose:
+        print(f"Total components: {N}, block size: {H}x{W}")
+
+    if verbose:
+        print("Training blind-spot CNN...")
+    model, _, _ = train_blindspot_denoiser(
+        basis_tensor,
+        epochs=epochs,
+        batch_size=batch_size,
+        device=device,
+        verbose=verbose,
+    )
+
+    if verbose:
+        print("Verifying blind-spot property...")
+    ok = verify_blindspot(model, H=H, W=W, device=device)
+    if not ok:
+        raise RuntimeError("Blind-spot verification FAILED. Architecture has a bug.")
+    if verbose:
+        print("  OK: blind-spot property verified.")
+
+    wrapper = SpatialDenoiserWrapper(model, device=device, standardize=True)
+
+    if verbose:
+        print("Checking roughness stability on pure Gaussian noise...")
+    stats = roughness_stability_check(wrapper, H=H, W=W, device=device)
+    if verbose:
+        print(f"  mean output std: {stats['mean_output_std']:.3f}")
+        print(f"  CV across trials: {stats['coefficient_of_variation']:.3f}")
+        if stats['coefficient_of_variation'] > 0.3:
+            print("  WARNING: high variance across noise trials. "
+                  "threshold_heuristic may produce unstable roughness cutoffs.")
+
+    return wrapper
+
+def verify_blindspot(
+    model: nn.Module,
+    H: int = 32,
+    W: int = 32,
+    device: str = 'cuda',
+    n_trials: int = 5,
+    atol: float = 1e-5,
+) -> bool:
+    """Perturb a single input pixel; output at the same position must not change."""
+    model = model.to(device).eval()
     x = torch.randn(1, 1, H, W, device=device)
-    
     with torch.no_grad():
-        out1, _ = model(x)
-        
-        x_perturbed = x.clone()
-        x_perturbed[0, 0, H//2, W//2] += 10.0
-        out2, _ = model(x_perturbed)
-        
-        diff = torch.abs(out1[0, 0, H//2, W//2] - out2[0, 0, H//2, W//2])
-    
-    return diff.item()
+        y0 = model(x)
+    ok = True
+    for _ in range(n_trials):
+        i = int(torch.randint(0, H, (1,)).item())
+        j = int(torch.randint(0, W, (1,)).item())
+        x2 = x.clone()
+        x2[0, 0, i, j] += 10.0
+        with torch.no_grad():
+            y1 = model(x2)
+        diff = (y1[0, 0, i, j] - y0[0, 0, i, j]).abs().item()
+        if diff > atol:
+            print(f"  BLIND-SPOT VIOLATION at ({i},{j}): diff = {diff:.2e}")
+            ok = False
+    return ok
+
+
+def roughness_stability_check(
+    denoiser: SpatialDenoiserWrapper,
+    H: int = 32,
+    W: int = 32,
+    n_components: int = 1,
+    n_trials: int = 100,
+    device: str = 'cuda',
+) -> Dict[str, float]:
+    """Statistics of denoiser output std on pure Gaussian noise inputs.
+
+    masknmf's `threshold_heuristic` calibrates spatial-roughness cutoffs on
+    Gaussian noise; an unstable denoiser will produce unreliable thresholds.
+    """
+    outs_std: List[float] = []
+    for _ in range(n_trials):
+        noise = torch.randn(H, W, n_components, device=device)
+        with torch.no_grad():
+            out = denoiser(noise)
+        outs_std.append(out.std().item())
+    arr = np.asarray(outs_std)
+    return {
+        'mean_output_std': float(arr.mean()),
+        'std_of_output_std': float(arr.std()),
+        'coefficient_of_variation': float(arr.std() / (arr.mean() + 1e-8)),
+    }
